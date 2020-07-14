@@ -28,10 +28,9 @@
         kernel,
         stdlib,
         couch_log,
-        mem3,
         config,
         couch,
-        couch_event,
-        couch_stats
+        couch_stats,
+        couch_jobs
     ]}
 ]}.

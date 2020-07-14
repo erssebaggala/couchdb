@@ -119,8 +119,9 @@ remove(#{jtx := true} = JTx0, #{job := true} = Job) ->
     #{type := Type, id := JobId} = Job,
     Key = job_key(JTx, Job),
     case get_job_val(Tx, Key) of
-        #jv{stime = STime} ->
+        #jv{stime = STime, seq = Seq} ->
             couch_jobs_pending:remove(JTx, Type, JobId, STime),
+            clear_activity(JTx, Type, Seq),
             erlfdb:clear(Tx, Key),
             update_watch(JTx, Type),
             ok;
@@ -413,7 +414,7 @@ init_cache() ->
 %
 encode_data(#{} = JobData) ->
     try
-        jiffy:encode(JobData)
+        iolist_to_binary(jiffy:encode(JobData, [force_utf8]))
     catch
         throw:{error, Error} ->
             % legacy clause since new versions of jiffy raise error instead
@@ -430,7 +431,7 @@ decode_data(#{} = JobData) ->
     JobData;
 
 decode_data(<<_/binary>> = JobData) ->
-    jiffy:decode(JobData, [return_maps]).
+    jiffy:decode(JobData, [dedupe_keys, return_maps]).
 
 
 % Cached job transaction object. This object wraps a transaction, caches the
@@ -597,10 +598,12 @@ set_job_val(Tx = {erlfdb_transaction, _}, Key, #jv{} = JV) ->
 get_job_or_halt(Tx, Key, JLock) ->
     case get_job_val(Tx, Key) of
         #jv{jlock = CurJLock} when CurJLock =/= JLock ->
+            couch_log:error("JJJJJ get_job_or_halt Cur:~p Exp:~p", [CurJLock, JLock]),
             halt;
         #jv{} = Res ->
             Res;
         not_found ->
+            couch_log:error("JJJJJ get_job_val not_found JLock:~p", [JLock]),
             halt
     end.
 
