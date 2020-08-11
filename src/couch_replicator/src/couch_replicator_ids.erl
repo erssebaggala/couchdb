@@ -105,22 +105,17 @@ job_id(DbUUID, DocId) when is_binary(DbUUID), is_binary(DocId) ->
     <<DbUUID/binary, "|", DocId/binary>>.
 
 
--spec convert([_] | binary() | {string(), string()}) -> {string(), string()}.
-convert(Id) when is_list(Id) ->
-    convert(?l2b(Id));
+-spec convert(binary()) -> binary().
 convert(Id0) when is_binary(Id0) ->
     % Spaces can result from mochiweb incorrectly unquoting + characters from
     % the URL path. So undo the incorrect parsing here to avoid forcing
     % users to url encode + characters.
     Id = binary:replace(Id0, <<" ">>, <<"+">>, [global]),
-    case binary:split(Id, <<"+">>) of
-        [BaseId, Ext] -> {BaseId, Ext};
-        [BaseId] -> {BaseId, <<>>}
-    end;
-convert({BaseId, Ext}) when is_list(BaseId), is_list(Ext) ->
-    {list_to_binary(BaseId), list_to_binary(Ext)};
-convert({BaseId, Ext} = Id) when is_binary(BaseId), is_binary(Ext) ->
-    Id.
+    {BaseId, ExtId} = case binary:split(Id, <<"+">>) of
+        [BId, Ext] -> {BId, Ext};
+        [BId] -> {BId, <<>>}
+    end,
+    iolist_to_binary([BaseId, ExtId]).
 
 
 % Private functions

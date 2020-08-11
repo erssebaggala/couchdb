@@ -13,23 +13,20 @@
 -module(couch_replicator).
 
 -export([
-    ensure_rep_db_exists/0,
-    replication_states/0,
-
     replicate/2,
 
-    % Monitoring helpers
     jobs/0,
     job/1,
     docs/2,
     doc/2,
 
-    % EPI callbacks
     after_db_create/2,
     after_db_delete/2,
     after_doc_write/6,
 
-    % Debug functions
+    ensure_rep_db_exists/0,
+    replication_states/0,
+
     rescan_jobs/0,
     rescan_jobs/1,
     reenqueue_jobs/0,
@@ -41,38 +38,20 @@
 -include("couch_replicator.hrl").
 
 
-% This is called from supervisor, must return ignore.
--spec ensure_rep_db_exists() -> ignore.
-ensure_rep_db_exists() ->
-    couch_replicator_jobs:set_timeout(),
-    case config:get_boolean("replicator", "create_replicator_db", false) of
-        true ->
-            UserCtx = #user_ctx{roles=[<<"_admin">>, <<"_replicator">>]},
-            Opts = [{user_ctx, UserCtx}, sys_db],
-            case fabric2_db:create(?REP_DB_NAME, Opts) of
-                {error, file_exists} -> ok;
-                {ok, _Db} -> ok
-            end;
-        false ->
-            ok
-    end,
-    ignore.
-
-
--spec replication_states() -> [binary()].
-replication_states() ->
-    [?ST_RUNNING, ?ST_FAILED, ?ST_COMPLETED, ?ST_PENDING, ?ST_CRASHING].
-
-
 -spec replicate({[_]}, any()) ->
     {ok, {continuous, binary()}} |
     {ok, {[_]}} |
     {ok, {cancelled, binary()}} |
     {error, any()} |
     no_return().
-replicate(PostBody, #user_ctx{name = UserName = UserCtx}) ->
-    {ok, JobId, Rep} = couch_replicator_parse:parse_transient_rep(PostBody, UserName),
+replicate(Body, #user_ctx{name = User} = UserCtx) ->
+    {ok, Id, Rep} = couch_replicator_parse:parse_transient_rep(Body, User),
     #{?OPTIONS := Options} = Rep,
+     JobId = case couch_replicator_jobs:get_job_id(undefined, Id) of
+        {ok, JobId0} -> JobId0;
+        {error, not_found} -> Id
+    end,
+    couch_log:error("xxxxx ~p", [JobId]),
     case maps:get(<<"cancel">>, Options, false) of
         true ->
             case check_authorization(JobId, UserCtx) of
@@ -88,13 +67,14 @@ replicate(PostBody, #user_ctx{name = UserName = UserCtx}) ->
             end
     end.
 
+
 jobs() ->
     FoldFun = fun(_JTx, _JobId, CouchJobsState, JobData, Acc) ->
-       case CouchJobsState of
-           pending -> [job_ejson(JobData) | Acc];
-           running -> [job_ejson(JobData) | Acc];
-           finished -> Acc
-       end
+        case CouchJobsState of
+            pending -> [job_ejson(JobData) | Acc];
+            running -> [job_ejson(JobData) | Acc];
+            finished -> Acc
+        end
     end,
     couch_replicator_jobs:fold_jobs(undefined, FoldFun, []).
 
@@ -132,8 +112,6 @@ doc(#{} = Db, DocId) when is_binary(DocId) ->
         {error, not_found} ->  {error, not_found}
     end.
 
-
-% EPI db plugin callbacks
 
 after_db_create(DbName, DbUUID) when ?IS_REP_DB(DbName)->
     couch_stats:increment_counter([couch_replicator, docs, dbs_created]),
@@ -174,6 +152,29 @@ after_doc_write(#{name := DbName} = Db, #doc{} = Doc, _NewWinner, _OldWinner,
 
 after_doc_write(_Db, _Doc, _NewWinner, _OldWinner, _NewRevId, _Seq) ->
     ok.
+
+
+% This is called from supervisor, must return ignore.
+-spec ensure_rep_db_exists() -> ignore.
+ensure_rep_db_exists() ->
+    couch_replicator_jobs:set_timeout(),
+    case config:get_boolean("replicator", "create_replicator_db", false) of
+        true ->
+            UserCtx = #user_ctx{roles=[<<"_admin">>, <<"_replicator">>]},
+            Opts = [{user_ctx, UserCtx}, sys_db],
+            case fabric2_db:create(?REP_DB_NAME, Opts) of
+                {error, file_exists} -> ok;
+                {ok, _Db} -> ok
+            end;
+        false ->
+            ok
+    end,
+    ignore.
+
+
+-spec replication_states() -> [binary()].
+replication_states() ->
+    [?ST_RUNNING, ?ST_FAILED, ?ST_COMPLETED, ?ST_PENDING, ?ST_CRASHING].
 
 
 rescan_jobs() ->
@@ -232,20 +233,15 @@ start_transient_job(JobId, #{} = Rep) ->
     end).
 
 
-
 -spec cancel_replication(rep_id()) ->
     {ok, {cancelled, binary()}} | {error, not_found}.
-cancel_replication(RepOrJobId) when is_binary(RepOrJobId) ->
-    couch_log:notice("Canceling replication '~s' ...", [RepOrJobId]),
-    JobId = case couch_replicator_jobs:get_job_id(undefined, RepOrJobId) of
-        {ok, Id} -> Id;
-        {error, not_found} -> RepOrJobId
-    end,
+cancel_replication(JobId) when is_binary(JobId) ->
+    couch_log:notice("Canceling replication '~s'", [JobId]),
     case couch_replicator_jobs:remove_job(undefined, JobId) of
         {error, not_found} ->
             {error, not_found};
         ok ->
-            {ok, {cancelled, RepOrJobId}}
+            {ok, {cancelled, JobId}}
     end.
 
 
@@ -283,18 +279,19 @@ process_change(#{} = Db, #doc{deleted = false} = Doc) ->
     couch_log:notice(LogMsg, [?MODULE, DbName, DocId, JobId]),
 
     couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(Db), fun(JTx) ->
-       case couch_replicator_jobs:get_job_data(JTx, JobId) of
+        case couch_replicator_jobs:get_job_data(JTx, JobId) of
             {ok, #{?REP := null, ?STATE_INFO := Error}} when Rep =:= null ->
                 % Same error as before occurred, don't bother updating the job
                 ok;
             {ok, #{?REP := null}} when Rep =:= null ->
-                % Error occured but it's a different error so the job is updated
+                % New error so the job is updated
                 couch_replicator_jobs:add_job(JTx, JobId, JobData);
             {ok, #{?REP := OldRep}} when is_map(Rep) ->
                 case couch_replicator_utils:compare_rep_objects(OldRep, Rep) of
                     true ->
-                        % Document was changed but none of the parameters relevent
-                        % for the replication job have changed, so make it a no-op
+                        % Document was changed but none of the parameters
+                        % relevent for the replication job have changed, so
+                        % make it a no-op
                         ok;
                     false ->
                         couch_replicator_jobs:add_job(JTx, JobId, JobData)
@@ -314,9 +311,9 @@ add_jobs_from_db(#{} = TxDb) ->
         (complete, ok) ->
             {ok, ok};
         ({row, Row}, ok) ->
-           Db = TxDb#{tx := undefined},
-           ok = process_change(Db, get_doc(TxDb, Row)),
-           {ok, ok}
+            Db = TxDb#{tx := undefined},
+            ok = process_change(Db, get_doc(TxDb, Row)),
+            {ok, ok}
     end,
     Opts = [{restart_tx, true}],
     {ok, ok} = fabric2_db:fold_docs(TxDb, FoldFun, ok, Opts),
@@ -328,7 +325,6 @@ get_doc(TxDb, Row) ->
     {_, DocId} = lists:keyfind(id, 1, Row),
     {ok, #doc{deleted = false} = Doc} = fabric2_db:open_doc(TxDb, DocId, []),
     Doc.
-
 
 
 doc_ejson(#{} = JobData) ->
@@ -425,15 +421,17 @@ ejson_url(null) ->
 
 
 -spec check_authorization(rep_id(), #user_ctx{}) -> ok | not_found.
-check_authorization(JobId, #user_ctx{name = Name} = Ctx) ->
+check_authorization(JobId, #user_ctx{} = Ctx) when is_binary(JobId) ->
+    #user_ctx{name = Name} = Ctx,
     case couch_replicator_jobs:get_job_data(undefined, JobId) of
-        {error_not, found} ->
+        {error, not_found} ->
             not_found;
-        #{?REP := #{?REP_USER := Name}} ->
+        {ok, #{?REP := #{?REP_USER := Name}}} ->
             ok;
-        #{} ->
+        {ok, #{}} ->
             couch_httpd:verify_is_server_admin(Ctx)
     end.
+
 
 
 -ifdef(TEST).
@@ -462,7 +460,7 @@ t_admin_is_always_authorized() ->
 
 
 t_username_must_match() ->
-     ?_test(begin
+    ?_test(begin
         expect_rep_user_ctx(<<"user">>, <<"somerole">>),
         UserCtx1 = #user_ctx{name = <<"user">>, roles = [<<"somerole">>]},
         ?assertEqual(ok, check_authorization(<<"RepId">>, UserCtx1)),
@@ -473,12 +471,13 @@ t_username_must_match() ->
 
 
 t_replication_not_found() ->
-     ?_test(begin
+    ?_test(begin
         meck:expect(couch_replicator_scheduler, rep_state, 1, nil),
         UserCtx1 = #user_ctx{name = <<"user">>, roles = [<<"somerole">>]},
         ?assertEqual(not_found, check_authorization(<<"RepId">>, UserCtx1)),
         UserCtx2 = #user_ctx{name = <<"adm">>, roles = [<<"_admin">>]},
         ?assertEqual(not_found, check_authorization(<<"RepId">>, UserCtx2))
     end).
+
 
 -endif.

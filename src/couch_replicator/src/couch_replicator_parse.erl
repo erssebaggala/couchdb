@@ -61,7 +61,7 @@ parse_rep_doc(RepDoc) ->
 
 
 -spec parse_transient_rep({[_]}, user_name()) -> {ok, #{}}.
-parse_transient_rep({[_]} = Doc, UserName) ->
+parse_transient_rep({[_ | _]} = Doc, UserName) ->
     {ok, Rep} = try
         parse_rep(Doc, UserName)
     catch
@@ -77,14 +77,14 @@ parse_transient_rep({[_]} = Doc, UserName) ->
         {true, nil} ->
             % Cancel request with no id, must parse id out of body contents
             JobId = couch_replicator_ids:job_id(Rep, null, null),
-            {ok, {JobId, Rep}};
+            {ok, JobId, Rep};
         {true, Id} ->
             % Cancel request with an id specified, so do not parse id from body
-            {ok, {Id, Rep}};
+            {ok, Id, Rep};
         {false, _Id} ->
             JobId = couch_replicator_ids:job_id(Rep, null, null),
             % Not a cancel request, regular replication doc
-            {ok, {JobId, Rep}}
+            {ok, JobId, Rep}
     end.
 
 
