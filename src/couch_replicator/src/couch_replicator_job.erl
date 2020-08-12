@@ -106,8 +106,8 @@ terminate(normal, #rep_state{} = State) ->
     case DbName of
         null ->
             % Transient jobs are removed as soon as they completed
-            #{?REP := Rep, ?DB_UUID := DbUUID, ?DOC_ID := DocId}= JobData,
-            JobId = couch_replicator_ids:job_id(Rep, DbUUID, DocId),
+            #{?REP := Rep} = JobData,
+            JobId = couch_replicator_ids:job_id(Rep, null, null),
             couch_replicator_jobs:remove_job(undefined, JobId);
         <<_/binary>> ->
             ok
@@ -123,7 +123,7 @@ terminate(shutdown, #rep_state{} = State0) ->
         State1
     end,
     #rep_state{job = Job, job_data = JobData} = State3,
-    ok = reschedule_job(undefined, Job, JobData),
+    ok = reschedule(undefined, Job, JobData),
     ok = close_endpoints(State3);
 
 terminate({shutdown, Error}, {init_error, Stack}) ->
@@ -403,17 +403,33 @@ do_init(Job, #{} = JobData) ->
     #{
         ?DB_NAME := DbName,
         ?DB_UUID := DbUUID,
-        ?DOC_ID := DocId
+        ?DOC_ID := DocId,
+        ?REP := Rep
     } = JobData,
 
     ok = couch_replicator_docs:remove_state_fields(DbName, DbUUID, DocId),
 
-    {Job2, JobData2} = couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(), fun(JTx) ->
-        finish_if_failed(JTx, Job, JobData),
+    ok = finish_if_failed(undefined, Job, JobData),
+
+    {Job2, JobData2, Owner} = couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(), fun(JTx) ->
         {Job1, JobData1} = set_running_state(JTx, Job, JobData, RepId, BaseId),
-        ok = assert_ownership(JTx, Job1, JobData1),
-        {Job1, JobData1}
+        {Job1, JobData1, assert_ownership(JTx, Job1, JobData1)}
     end),
+
+    % Handle ownership decision here to be outside of the transaction
+    case Owner of
+        owner ->
+            ok;
+        {not_owner, reschedule} ->
+            exit({shutdown, finished});
+        {not_owner, fail} when DbName =:= null ->
+            % Transient jobs are removed as soon as they completed
+            JobId = couch_replicator_ids:job_id(Rep, null, null),
+            couch_replicator_jobs:remove_job(undefined, JobId),
+            exit({shutdown, finished});
+        {not_owner, fail} when is_binary(DbName) ->
+            exit({shutdown, finished})
+    end,
 
     #rep_state{
         source = Source,
@@ -511,27 +527,29 @@ assert_ownership(#{jtx := true} = JTx, Job, JobData) ->
     JobId = couch_replicator_ids:job_id(Rep, DbUUID, DocId),
     case couch_replicator_jobs:try_update_rep_id(JTx, JobId, RepId) of
         ok ->
-            ok;
+            owner;
         {error, {replication_job_conflict, OtherJobId}} ->
             case couch_replicator_jobs:get_job_data(JTx, OtherJobId) of
                 {ok, #{?STATE := S, ?DB_NAME := null}} when
                         S == ?ST_RUNNING; S == ?ST_PENDING ->
                     Error = <<"Duplicate job running: ", OtherJobId/binary>>,
                     reschedule_on_error(JTx, Job, JobData, Error),
-                    exit({shutdown, finished});
+                    {not_owner, reschedule};
                 {ok, #{?STATE := S, ?DB_NAME := <<_/binary>>}} when
                         S == ?ST_RUNNING; S == ?ST_PENDING ->
                     Error = <<"Duplicate job running: ", OtherJobId/binary>>,
                     fail_job(JTx, Job, JobData, Error),
-                    exit({shutdown, finished});
+                    {not_owner, fail};
                 {ok, #{}} ->
                     LogMsg = "~p : Job ~p usurping job ~p for replication ~p",
                     couch_log:warning(LogMsg, [?MODULE, JobId, OtherJobId]),
-                    ok = couch_replicator_jobs:update_rep_id(JTx, JobId, RepId);
+                    ok = couch_replicator_jobs:update_rep_id(JTx, JobId, RepId),
+                    owner;
                 {error, not_found} ->
-                     LogMsg = "~p : Orphan replication job reference ~p -> ~p",
-                     couch_log:error(LogMsg, [?MODULE, RepId, OtherJobId]),
-                     ok = couch_replicator_jobs:update_rep_id(JTx, JobId, RepId)
+                    LogMsg = "~p : Orphan replication job reference ~p -> ~p",
+                    couch_log:error(LogMsg, [?MODULE, RepId, OtherJobId]),
+                    ok = couch_replicator_jobs:update_rep_id(JTx, JobId, RepId),
+                    owner
              end
     end.
 
@@ -612,18 +630,18 @@ reschedule_on_error(JTx, Job, JobData0, Error0) ->
     },
     JobData2 = hist_append(?HIST_CRASHED, NowSec, JobData1, Error),
     JobData3 = hist_append(?HIST_PENDING, NowSec, JobData2, undefined),
-
+    JobData4 = fabric2_active_tasks:update_active_task(JobData3, #{}),
     couch_stats:increment_counter([couch_replicator, jobs, crashes]),
 
     Time = get_backoff_time(ErrorCount + 1),
-    case couch_replicator_jobs:reschedule_job(JTx, Job, JobData3, Time) of
+    case couch_replicator_jobs:reschedule(JTx, Job, JobData4, Time) of
         ok -> ok;
         {error, halt} -> exit({shutdown, halt})
     end.
 
 
-reschedule_job(JTx, Job, JobData) ->
-    couch_log:error("~p : reschedule_job ~p", [?MODULE, JobData]),
+reschedule(JTx, Job, JobData) ->
+    couch_log:error("~p : reschedule ~p", [?MODULE, JobData]),
     NowSec = erlang:system_time(second),
 
     JobData1 = JobData#{
@@ -635,11 +653,11 @@ reschedule_job(JTx, Job, JobData) ->
     },
     JobData2 = hist_append(?HIST_STOPPED, NowSec, JobData1, undefined),
     JobData3 = hist_append(?HIST_PENDING, NowSec, JobData2, undefined),
-
+    JobData4 = fabric2_active_tasks:update_active_task(JobData3, #{}),
     couch_stats:increment_counter([couch_replicator, jobs, stops]),
 
     Time = erlang:system_time(second),
-    case couch_replicator_job:reschedule_job(JTx, Job, JobData3, Time) of
+    case couch_replicator_jobs:reschedule_job(JTx, Job, JobData4, Time) of
         ok -> ok;
         {error, halt} -> exit({shutdown, halt})
     end.
@@ -665,10 +683,10 @@ fail_job(JTx, Job, #{} = JobData, Error0) ->
 
     NowSec = erlang:system_time(second),
     JobData2 = hist_append(?HIST_CRASHED, NowSec, JobData1, Error),
-
+    JobData3 = fabric2_active_tasks:update_active_task(JobData2, #{}),
     couch_stats:increment_counter([couch_replicator, jobs, crashes]),
 
-    case couch_replicator_jobs:finish_job(JTx, Job, JobData2) of
+    case couch_replicator_jobs:finish_job(JTx, Job, JobData3) of
         ok ->
             couch_replicator_docs:update_failed(DbName, DbUUID, DocId),
             ok;
@@ -698,10 +716,10 @@ complete_job(JTx, Job, JobData, CheckpointHistory) ->
 
     NowSec = erlang:system_time(second),
     JobData2 = hist_append(?HIST_STOPPED, NowSec, JobData1, undefined),
-
+    JobData3 = fabric2_active_tasks:update_active_task(JobData2, #{}),
     couch_stats:increment_counter([couch_replicator, jobs, stops]),
 
-    case couch_replicator_jobs:finish_job(JTx, Job, JobData2) of
+    case couch_replicator_jobs:finish_job(JTx, Job, JobData3) of
         ok ->
             StartTimeISO8601 = couch_replicator_utils:iso8601(StartTime),
             Stats = maps:merge(RepStats, #{
@@ -1354,7 +1372,7 @@ check_user_filter(#rep_state{} = State) ->
         {OtherId, _} when is_binary(OtherId) ->
             LogMsg = "~p : Replication id was updated ~p -> ~p",
             couch_log:error(LogMsg, [?MODULE, RepId, OtherId]),
-            reschedule_job(undefined, Job, JobData),
+            reschedule(undefined, Job, JobData),
             exit({shutdown, finished})
     end.
 

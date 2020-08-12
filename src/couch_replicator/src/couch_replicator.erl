@@ -51,7 +51,6 @@ replicate(Body, #user_ctx{name = User} = UserCtx) ->
         {ok, JobId0} -> JobId0;
         {error, not_found} -> Id
     end,
-    couch_log:error("xxxxx ~p", [JobId]),
     case maps:get(<<"cancel">>, Options, false) of
         true ->
             case check_authorization(JobId, UserCtx) of
