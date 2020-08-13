@@ -25,7 +25,6 @@
     after_doc_write/6,
 
     ensure_rep_db_exists/0,
-    replication_states/0,
 
     rescan_jobs/0,
     rescan_jobs/1,
@@ -171,10 +170,7 @@ ensure_rep_db_exists() ->
     ignore.
 
 
--spec replication_states() -> [binary()].
-replication_states() ->
-    [?ST_RUNNING, ?ST_FAILED, ?ST_COMPLETED, ?ST_PENDING, ?ST_CRASHING].
-
+% Testing and debug functions
 
 rescan_jobs() ->
     rescan_jobs(?REP_DB_NAME).

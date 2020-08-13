@@ -156,17 +156,16 @@ parse_replication_states(undefined) ->
     [];  % This is the default (wildcard) filter
 
 parse_replication_states(States) when is_list(States) ->
-    AllStates = couch_replicator:replication_states(),
-    StrStates = [string:to_lower(S) || S <- string:tokens(States, ",")],
-    BinStates =  [list_to_binary(S) || S <- StrStates],
-    AllSet = sets:from_list(AllStates),
+    All = [?ST_RUNNING, ?ST_FAILED, ?ST_COMPLETED, ?ST_PENDING, ?ST_CRASHING],
+    AllSet = sets:from_list(All),
+    BinStates = [?l2b(string:to_lower(S)) || S <- string:tokens(States, ",")],
     StatesSet = sets:from_list(BinStates),
     Diff = sets:to_list(sets:subtract(StatesSet, AllSet)),
     case Diff of
         [] ->
             BinStates;
         _ ->
-            Args = [Diff, AllStates],
+            Args = [Diff, All],
             Msg2 = io_lib:format("Unknown states ~p. Choose from: ~p", Args),
             throw({query_parse_error, ?l2b(Msg2)})
     end.
