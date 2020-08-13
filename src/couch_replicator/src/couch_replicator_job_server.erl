@@ -170,9 +170,11 @@ reschedule(#{} = St) ->
     MinSlotsChurn = min(Slots, ChurnLeft),
 
     Pending = if MinSlotsChurn =< 0 -> 0; true ->
-        % Don't fetch pending if we don't have enough slots of churn budget
+        % Don't fetch pending if we don't have enough slots or churn budget
         couch_replicator_jobs:pending_count(undefined)
     end,
+
+    couch_stats:update_gauge([couch_replicator, jobs, pending], Pending),
 
     % Start new acceptors only if we have churn budget, there are pending jobs
     % and we won't start more than max jobs + churn total acceptors

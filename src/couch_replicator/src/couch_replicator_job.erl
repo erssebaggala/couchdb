@@ -409,11 +409,18 @@ do_init(Job, #{} = JobData) ->
 
     ok = couch_replicator_docs:remove_state_fields(DbName, DbUUID, DocId),
 
-    ok = finish_if_failed(undefined, Job, JobData),
+    % Finish if job is in a failed state already
+    case JobData of
+        #{?STATE := ?ST_FAILED, ?STATE_INFO := Error} ->
+            ok = fail_job(undefined, Job, JobData, Error),
+            exit({shutdown, finished});
+        #{?STATE := St} when is_binary(St), St =/= ?ST_FAILED ->
+            ok
+    end,
 
     {Job2, JobData2, Owner} = couch_jobs_fdb:tx(couch_jobs_fdb:get_jtx(), fun(JTx) ->
         {Job1, JobData1} = set_running_state(JTx, Job, JobData, RepId, BaseId),
-        {Job1, JobData1, assert_ownership(JTx, Job1, JobData1)}
+        {Job1, JobData1, check_ownership(JTx, Job1, JobData1)}
     end),
 
     % Handle ownership decision here to be outside of the transaction
@@ -479,16 +486,6 @@ do_init(Job, #{} = JobData) ->
     update_job_state(State1).
 
 
-finish_if_failed(JTx, Job, #{} = JobData) ->
-    case JobData of
-        #{?REP := null, ?STATE := ?ST_FAILED, ?STATE_INFO := Error} ->
-            ok = fail_job(JTx, Job, JobData, Error),
-            exit({shutdown, finished});
-        #{?REP := #{}} ->
-            ok
-    end.
-
-
 set_running_state(_, Job, #{?REP_ID := RepId} = JobData, RepId, _) ->
     {Job, JobData};
 
@@ -517,7 +514,7 @@ set_running_state(#{jtx := true} = JTx, Job, #{} = JobData, RepId, BaseId) ->
     update_job_data(JTx, Job, JobData2).
 
 
-assert_ownership(#{jtx := true} = JTx, Job, JobData) ->
+check_ownership(#{jtx := true} = JTx, Job, JobData) ->
     #{
         ?REP_ID := RepId,
         ?REP := Rep,
